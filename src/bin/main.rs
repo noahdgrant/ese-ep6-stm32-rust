@@ -13,6 +13,7 @@ use hal::{
 
 #[cortex_m_rt::entry]
 fn main() -> ! {
+    defmt::println!("Hello world");
     // Set up CPU peripherals
     let cp = cortex_m::Peripherals::take().unwrap();
 
