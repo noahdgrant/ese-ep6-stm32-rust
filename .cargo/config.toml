@@ -1,6 +1,5 @@
 [target.'cfg(all(target_arch = "arm", target_os = "none"))']
 runner = ["probe-rs", "run", "--chip", "STM32F303RETx", "--log-format", "{L} {s}"] # Custom log format
-
 rustflags = [
   "-C", "linker=flip-link",
   "-C", "link-arg=-Tlink.x",
@@ -14,3 +13,4 @@ target = "thumbv7em-none-eabihf" # Cortex-M4F and Cortex-M7F (with FPU)
 [alias]
 rb = "run --bin"
 rrb = "run --release --bin"
+bbr = "build --release --bin"

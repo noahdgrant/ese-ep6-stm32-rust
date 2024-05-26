@@ -1,13 +1,12 @@
 #![no_main]
 #![no_std]
 
-use cortex_m_semihosting::debug;
-
-use defmt_rtt as _; // global logger
-
-use hal as _; // memory layout
+use core::sync::atomic::{AtomicUsize, Ordering};
+use defmt_brtt as _; // global logger
 
 use panic_probe as _;
+
+use stm32f3xx_hal as _; // memory layout
 
 // same panicking *behavior* as `panic-probe` but doesn't print a panic message
 // this prevents the panic message being printed *twice* when `defmt::panic` is invoked
@@ -16,36 +15,17 @@ fn panic() -> ! {
     cortex_m::asm::udf()
 }
 
-/// Terminates the application and makes a semihosting-capable debug tool exit
-/// with status code 0.
+static COUNT: AtomicUsize = AtomicUsize::new(0);
+defmt::timestamp!("{=usize}", {
+    // NOTE(no-CAS) `timestamps` runs with interrupts disabled
+    let n = COUNT.load(Ordering::Relaxed);
+    COUNT.store(n + 1, Ordering::Relaxed);
+    n
+});
+
+/// Terminates the application and makes `probe-rs` exit with exit-code = 0
 pub fn exit() -> ! {
     loop {
-        debug::exit(debug::EXIT_SUCCESS);
-    }
-}
-
-/// Hardfault handler.
-///
-/// Terminates the application and makes a semihosting-capable debug tool exit
-/// with an error. This seems better than the default, which is to spin in a
-/// loop.
-#[cortex_m_rt::exception]
-unsafe fn HardFault(_frame: &cortex_m_rt::ExceptionFrame) -> ! {
-    loop {
-        debug::exit(debug::EXIT_FAILURE);
-    }
-}
-
-// defmt-test 0.3.0 has the limitation that this `#[tests]` attribute can only be used
-// once within a crate. the module can be in any file but there can only be at most
-// one `#[tests]` module in this library crate
-#[cfg(test)]
-#[defmt_test::tests]
-mod unit_tests {
-    use defmt::assert;
-
-    #[test]
-    fn it_works() {
-        assert!(true)
+        cortex_m::asm::bkpt();
     }
 }

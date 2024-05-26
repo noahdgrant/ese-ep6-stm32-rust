@@ -1,4 +1,5 @@
-# About
+# EP6 Floor and Car Controller
+## About
 
  TODO
 
@@ -17,3 +18,6 @@ DEFMT_LOG=<level> cargo run
 currently when you press Ctrl+C after running `cargo run` the program stops running
 on the STM32F3.
 - look into using a different stm32 hal. This one doesn't protect you from trying to configure the same pin twice.
+
+## Resources
+RTIC - https://rtic.rs/2/book/en/
