@@ -1,98 +1,416 @@
+//! Floor controller code for Engineering Project 6
+
 #![no_main]
 #![no_std]
 
-use floor_controller as _; // global logger + panicking-behavior + memory layout
+use elevator as _; // global logger + panicking-behavior + memory layout
 
-use core::cell::RefCell;
-
-use cortex_m::peripheral::NVIC;
-use critical_section::{with, Mutex};
-use hal::{
-    self,
-    clocks::Clocks,
-    gpio::{self, Edge, Pin, PinMode, Port, Pull},
-    low_power,
-    pac::{self, interrupt},
-    prelude::*,
-    timer::{Timer, TimerInterrupt},
+use bxcan::{
+    filter::Mask32,
+    {Frame, StandardId},
 };
+use cortex_m::{asm, peripheral::NVIC};
+use nb::block;
+use rtic::app;
+use stm32f3xx_hal::{
+    can::Can,
+    gpio::{
+        Alternate, Edge, Gpioa, Input, Output, Pin, PushPull, PA4, PA5, PA6, PA7, PB0, PB1, PB12,
+        PB14, PB15, PC13, PC5, U,
+    },
+    pac::Interrupt,
+    pac::TIM2,
+    prelude::*,
+    timer::Timer,
+};
+use systick_monotonic::{Systick, *};
 
-make_globals!((ONBOARD_LED, Pin), (DEBOUNCE_TIMER, Timer<pac::TIM2>),);
+const ID_ELEVATOR_CONTROLLER: u16 = 0x101;
+const ID_CAR_CONTROLLER: u16 = 0x200;
+const ID_FLOOR_1: u16 = 0x201;
+const ID_FLOOR_2: u16 = 0x202;
+const ID_FLOOR_3: u16 = 0x203;
 
-#[cortex_m_rt::entry]
-fn main() -> ! {
-    // Set up CPU peripherals
-    let mut cp = cortex_m::Peripherals::take().unwrap();
+// Change this to one of the above ID's to change the ID that is put on the CAN bus
+const ID: u16 = ID_CAR_CONTROLLER;
 
-    // Set up microcontroller peripherals
-    let dp = pac::Peripherals::take().unwrap();
+const GO_TO_FLOOR_1: u8 = 0x05;
+const GO_TO_FLOOR_2: u8 = 0x06;
+const GO_TO_FLOOR_3: u8 = 0x07;
 
-    // this line is required if you want to take advantage of ST-Link
-    hal::debug_workaround();
+#[app(device = stm32f3xx_hal::pac, peripherals = true, dispatchers = [SPI1])]
+mod app {
+    use super::*;
 
-    let clock_cfg = Clocks::default();
-    if clock_cfg.setup().is_err() {
-        defmt::panic!("Unable to configure clock due to speed error")
-    };
-
-    let onboard_led = Pin::new(Port::A, 5, PinMode::Output);
-
-    let mut btn_blue = Pin::new(Port::C, 13, PinMode::Input);
-    btn_blue.pull(Pull::Floating);
-    btn_blue.enable_interrupt(Edge::Falling);
-
-    let mut debounce_timer = Timer::new_tim2(dp.TIM2, 5.0, Default::default(), &clock_cfg);
-    debounce_timer.enable_interrupt(TimerInterrupt::Update);
-
-    // Unmask interrupt lines
-    unsafe {
-        NVIC::unmask(pac::Interrupt::EXTI15_10);
-        NVIC::unmask(pac::Interrupt::TIM2);
-
-        cp.NVIC.set_priority(pac::Interrupt::EXTI15_10, 0);
-        cp.NVIC.set_priority(pac::Interrupt::TIM2, 1);
+    // Shared resources go here
+    #[shared]
+    struct Shared {
+        can: bxcan::Can<
+            Can<
+                Pin<Gpioa, U<12>, Alternate<PushPull, 9>>,
+                Pin<Gpioa, U<11>, Alternate<PushPull, 9>>,
+            >,
+        >,
+        led_onboard: PA5<Output<PushPull>>,
+        led_floor_1: PA4<Output<PushPull>>,
+        led_floor_2: PA6<Output<PushPull>>,
+        led_floor_3: PA7<Output<PushPull>>,
     }
 
-    // Setup as globally accessible variables so they can be accessed inside interrupts
-    with(|cs| {
-        DEBOUNCE_TIMER.borrow(cs).replace(Some(debounce_timer));
-        ONBOARD_LED.borrow(cs).replace(Some(onboard_led));
-    });
-
-    defmt::debug!("Hardware initialized");
-
-    loop {
-        low_power::sleep_now();
+    // Local resources go here
+    #[local]
+    struct Local {
+        btn_onboard: PC13<Input>,
+        btn_floor_1: PB12<Input>,
+        btn_floor_2: PB15<Input>,
+        btn_floor_3: PB14<Input>,
+        led_current_floor_1: PC5<Output<PushPull>>,
+        led_current_floor_2: PB0<Output<PushPull>>,
+        led_current_floor_3: PB1<Output<PushPull>>,
+        tim2: Timer<TIM2>,
     }
-}
 
-#[interrupt]
-fn EXTI15_10() {
-    with(|cs| {
-        // Clear the interrupt flag, to prevent continous firing.
-        gpio::clear_exti_interrupt(13);
+    #[monotonic(binds = SysTick, default = true)]
+    type MonoTimer = Systick<1000>;
 
-        // A helper macro to access the pin and timer we stored in mutexes.
-        access_global!(DEBOUNCE_TIMER, debounce_timer, cs);
-        if debounce_timer.is_enabled() {
-            return;
+    #[init]
+    fn init(cx: init::Context) -> (Shared, Local, init::Monotonics) {
+        defmt::debug!("Start");
+
+        // Get access to device peripherals
+        let mut flash = cx.device.FLASH.constrain();
+        let mut rcc = cx.device.RCC.constrain();
+        let mut syscfg = cx.device.SYSCFG.constrain(&mut rcc.apb2);
+        let mut exti = cx.device.EXTI;
+
+        // Get GPIO banks
+        let mut gpioa = cx.device.GPIOA.split(&mut rcc.ahb);
+        let mut gpiob = cx.device.GPIOB.split(&mut rcc.ahb);
+        let mut gpioc = cx.device.GPIOC.split(&mut rcc.ahb);
+
+        // Setup clocks
+        let clocks = rcc
+            .cfgr
+            .use_hse(8.MHz())
+            .sysclk(36.MHz())
+            .pclk1(36.MHz())
+            .freeze(&mut flash.acr);
+
+        // Tell the scheduler which clock to use
+        let mono = Systick::new(cx.core.SYST, 36_000_000);
+
+        // Setup CAN
+        let can_tx =
+            gpioa
+                .pa12
+                .into_af_push_pull::<9>(&mut gpioa.moder, &mut gpioa.otyper, &mut gpioa.afrh);
+
+        let can_rx =
+            gpioa
+                .pa11
+                .into_af_push_pull::<9>(&mut gpioa.moder, &mut gpioa.otyper, &mut gpioa.afrh);
+
+        // http://www.bittiming.can-wiki.info
+        let mut can = bxcan::Can::builder(Can::new(cx.device.CAN, can_tx, can_rx, &mut rcc.apb1))
+            .set_bit_timing(0x0069000f) // Bit rate: 125kbps, sample point 61.1%
+            .set_loopback(false)
+            .set_silent(false)
+            .leave_disabled();
+        can.enable_interrupt(bxcan::Interrupt::Fifo0MessagePending);
+
+        let filter_id = StandardId::new(ID_ELEVATOR_CONTROLLER).unwrap();
+        let filter_mask = StandardId::new(0x7FF).unwrap(); // Accept only the specified ID
+
+        let mut filters = can.modify_filters();
+        filters.enable_bank(
+            0,
+            bxcan::Fifo::Fifo0,
+            Mask32::frames_with_std_id(filter_id, filter_mask),
+        );
+
+        // Enable filters
+        drop(filters);
+
+        // Sync to the bus and start normal operation
+        block!(can.enable_non_blocking()).ok();
+
+        // Setup status LEDs
+        let mut led_onboard = gpioa
+            .pa5
+            .into_push_pull_output(&mut gpioa.moder, &mut gpioa.otyper);
+        led_onboard.set_low().unwrap();
+
+        let mut led_floor_1 = gpioa
+            .pa4
+            .into_push_pull_output(&mut gpioa.moder, &mut gpioa.otyper);
+        led_floor_1.set_low().unwrap();
+
+        let mut led_floor_2 = gpioa
+            .pa6
+            .into_push_pull_output(&mut gpioa.moder, &mut gpioa.otyper);
+        led_floor_2.set_low().unwrap();
+
+        let mut led_floor_3 = gpioa
+            .pa7
+            .into_push_pull_output(&mut gpioa.moder, &mut gpioa.otyper);
+        led_floor_3.set_low().unwrap();
+
+        // Car current floor LEDs
+        let mut led_current_floor_1 = gpioc
+            .pc5
+            .into_push_pull_output(&mut gpioc.moder, &mut gpioc.otyper);
+        led_current_floor_1.set_low().unwrap();
+
+        let mut led_current_floor_2 = gpiob
+            .pb0
+            .into_push_pull_output(&mut gpiob.moder, &mut gpiob.otyper);
+        led_current_floor_2.set_low().unwrap();
+
+        let mut led_current_floor_3 = gpiob
+            .pb1
+            .into_push_pull_output(&mut gpiob.moder, &mut gpiob.otyper);
+        led_current_floor_3.set_low().unwrap();
+
+        // Setup buttons
+        let mut btn_onboard = gpioc
+            .pc13
+            .into_floating_input(&mut gpioc.moder, &mut gpioc.pupdr);
+        syscfg.select_exti_interrupt_source(&btn_onboard);
+        btn_onboard.trigger_on_edge(&mut exti, Edge::Falling);
+        btn_onboard.enable_interrupt(&mut exti);
+        let btn_onboard_interrupt_num = btn_onboard.interrupt();
+
+        let mut btn_floor_1 = gpiob
+            .pb12
+            .into_floating_input(&mut gpiob.moder, &mut gpiob.pupdr);
+        syscfg.select_exti_interrupt_source(&btn_floor_1);
+        btn_floor_1.trigger_on_edge(&mut exti, Edge::Falling);
+        btn_floor_1.enable_interrupt(&mut exti);
+        let btn_floor_1_interrupt_num = btn_floor_1.interrupt();
+
+        let mut btn_floor_2 = gpiob
+            .pb15
+            .into_floating_input(&mut gpiob.moder, &mut gpiob.pupdr);
+        syscfg.select_exti_interrupt_source(&btn_floor_2);
+        btn_floor_2.trigger_on_edge(&mut exti, Edge::Falling);
+        btn_floor_2.enable_interrupt(&mut exti);
+        let btn_floor_2_interrupt_num = btn_floor_2.interrupt();
+
+        let mut btn_floor_3 = gpiob
+            .pb14
+            .into_floating_input(&mut gpiob.moder, &mut gpiob.pupdr);
+        syscfg.select_exti_interrupt_source(&btn_floor_3);
+        btn_floor_3.trigger_on_edge(&mut exti, Edge::Falling);
+        btn_floor_3.enable_interrupt(&mut exti);
+        let btn_floor_3_interrupt_num = btn_floor_3.interrupt();
+
+        // Setup debounce timer
+        let tim2 = Timer::new(cx.device.TIM2, clocks, &mut rcc.apb1);
+
+        unsafe {
+            NVIC::unmask(btn_onboard_interrupt_num);
+            NVIC::unmask(btn_floor_1_interrupt_num);
+            NVIC::unmask(btn_floor_2_interrupt_num);
+            NVIC::unmask(btn_floor_3_interrupt_num);
+            NVIC::unmask(Interrupt::USB_LP_CAN_RX0);
+        };
+
+        defmt::debug!("Hardware configuration complete");
+
+        // Setup resources
+        (
+            Shared {
+                can,
+                led_onboard,
+                led_floor_1,
+                led_floor_2,
+                led_floor_3,
+            },
+            Local {
+                btn_onboard,
+                btn_floor_1,
+                btn_floor_2,
+                btn_floor_3,
+                led_current_floor_1,
+                led_current_floor_2,
+                led_current_floor_3,
+                tim2,
+            },
+            init::Monotonics(mono),
+        )
+    }
+
+    #[idle]
+    fn idle(_: idle::Context) -> ! {
+        loop {
+            asm::wfi();
+        }
+    }
+
+    #[task(binds = EXTI15_10,
+        local = [btn_onboard, btn_floor_1, btn_floor_2, btn_floor_3, tim2],
+        shared = [can, led_onboard, led_floor_1, led_floor_2, led_floor_3])]
+    fn exti15_10(mut cx: exti15_10::Context) {
+        defmt::debug!("EXTI15_10 interrupt");
+
+        let data: Option<[u8; 1]>;
+
+        if cx.local.btn_onboard.is_interrupt_pending() {
+            cx.local.btn_onboard.clear_interrupt();
+            defmt::debug!("Onboard button pressed");
+
+            match ID {
+                ID_CAR_CONTROLLER => {
+                    data = Some([0]);
+                }
+                ID_FLOOR_1 => {
+                    data = Some([GO_TO_FLOOR_1]);
+                }
+                ID_FLOOR_2 => {
+                    data = Some([GO_TO_FLOOR_2]);
+                }
+                ID_FLOOR_3 => {
+                    data = Some([GO_TO_FLOOR_3]);
+                }
+                _ => {
+                    data = Some([0]);
+                }
+            }
+        } else if cx.local.btn_floor_1.is_interrupt_pending() {
+            defmt::debug!("Floor 1 button pressed");
+            cx.local.btn_floor_1.clear_interrupt();
+
+            defmt::debug!("Floor 1 LED on");
+            cx.shared.led_floor_1.lock(|led| {
+                led.set_high().unwrap();
+            });
+
+            data = Some([GO_TO_FLOOR_1]);
+        } else if cx.local.btn_floor_2.is_interrupt_pending() {
+            defmt::debug!("Floor 2 button pressed");
+            cx.local.btn_floor_2.clear_interrupt();
+
+            defmt::debug!("Floor 2 LED on");
+            cx.shared.led_floor_2.lock(|led| {
+                led.set_high().unwrap();
+            });
+
+            data = Some([GO_TO_FLOOR_2]);
+        } else if cx.local.btn_floor_3.is_interrupt_pending() {
+            defmt::debug!("Floor 3 button pressed");
+            cx.local.btn_floor_3.clear_interrupt();
+
+            defmt::debug!("Floor 3 LED on");
+            cx.shared.led_floor_3.lock(|led| {
+                led.set_high().unwrap();
+            });
+
+            data = Some([GO_TO_FLOOR_3]);
+        } else {
+            defmt::panic!("Unhandeled exti15_10 interrupt");
         }
 
-        access_global!(ONBOARD_LED, onboard_led, cs);
-        onboard_led.toggle();
+        // Turn onboared LED on to indicate that a CAN message is being sent
+        defmt::debug!("Onboard LED on");
+        cx.shared.led_onboard.lock(|led| {
+            led.set_high().unwrap();
+        });
 
-        debounce_timer.enable();
-    });
+        // Schedule the task to turn the onboard LED off
+        if let Err(_e) = led_onboard_off::spawn_after(2.secs()) {
+            // TODO: Reschedule the task if the button is pressed again
+            // before the 2 seconds have passed.
+            defmt::warn!("Task already started");
+        }
+
+        // Send CAN message
+        let frame = Frame::new_data(
+            StandardId::new(ID).unwrap(),
+            data.expect("Missing CAN data"),
+        );
+        cx.shared.can.lock(|can| {
+            block!(can.transmit(&frame)).expect("Cannot send CAN frame");
+        });
+        defmt::debug!(
+            "[CAN] tx: id = {:#04x} data = {:#02x}",
+            ID,
+            data.expect("Missing CAN data")[0]
+        );
+    }
+
+    #[task(binds = USB_LP_CAN_RX0,
+        local = [led_current_floor_1, led_current_floor_2, led_current_floor_3],
+        shared = [can, led_onboard, led_floor_1, led_floor_2, led_floor_3])]
+    fn can_rx0(mut cx: can_rx0::Context) {
+        defmt::debug!("CAN rx interrupt");
+
+        let mut can_frame: Option<Frame> = None;
+        cx.shared.can.lock(|can| {
+            can_frame = Some(block!(can.receive()).expect("Cannot receive CAN frame"));
+        });
+
+        if let Some(frame) = can_frame.as_ref() {
+            if let Some(data) = frame.data() {
+                defmt::debug!(
+                    "[CAN] rx: id = {:#x} data = {:#02x}",
+                    frame.id_as_raw(),
+                    data[0],
+                );
+
+                match data[0] {
+                    GO_TO_FLOOR_1 => {
+                        cx.shared.led_floor_1.lock(|led| {
+                            defmt::debug!("Floor 1 LED off");
+                            led.set_low().unwrap();
+                        });
+                        cx.local.led_current_floor_1.set_high().unwrap();
+                        cx.local.led_current_floor_2.set_low().unwrap();
+                        cx.local.led_current_floor_3.set_low().unwrap();
+                    }
+                    GO_TO_FLOOR_2 => {
+                        cx.shared.led_floor_2.lock(|led| {
+                            defmt::debug!("Floor 2 LED off");
+                            led.set_low().unwrap();
+                        });
+                        cx.local.led_current_floor_1.set_low().unwrap();
+                        cx.local.led_current_floor_2.set_high().unwrap();
+                        cx.local.led_current_floor_3.set_low().unwrap();
+                    }
+                    GO_TO_FLOOR_3 => {
+                        cx.shared.led_floor_3.lock(|led| {
+                            defmt::debug!("Floor 3 LED off");
+                            led.set_low().unwrap();
+                        });
+                        cx.local.led_current_floor_1.set_low().unwrap();
+                        cx.local.led_current_floor_2.set_low().unwrap();
+                        cx.local.led_current_floor_3.set_high().unwrap();
+                    }
+                    _ => (),
+                }
+            }
+        }
+    }
+
+    #[task(shared = [led_onboard])]
+    fn led_onboard_off(mut cx: led_onboard_off::Context) {
+        defmt::debug!("Onboard LED off");
+        cx.shared.led_onboard.lock(|led| {
+            led.set_low().unwrap();
+        });
+    }
 }
 
-#[interrupt]
-fn TIM2() {
-    with(|cs| {
-        access_global!(DEBOUNCE_TIMER, debounce_timer, cs);
-        // Clear the interrupt flag. If you ommit this, it will fire repeatedly.
-        debounce_timer.clear_interrupt(TimerInterrupt::Update);
+trait GetId {
+    /// Returns the raw value of the id. The value is always a u32 since
+    /// extended IDs are u32.
+    fn id_as_raw(&self) -> u32;
+}
 
-        // Disable the timer until next time you press a button.
-        debounce_timer.disable();
-    });
+impl GetId for bxcan::Frame {
+    fn id_as_raw(&self) -> u32 {
+        match self.id() {
+            bxcan::Id::Standard(id) => id.as_raw().into(),
+            bxcan::Id::Extended(id) => id.as_raw(),
+        }
+    }
 }

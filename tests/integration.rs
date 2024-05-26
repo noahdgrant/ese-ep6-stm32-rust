@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-use template_stm32f3_rust as _; // global logger + panicking-behavior + memory layout
+use elevator as _; // global logger + panicking-behavior + memory layout
 
 // See https://crates.io/crates/defmt-test/0.3.0 for more documentation (e.g. about the 'state'
 // feature)
