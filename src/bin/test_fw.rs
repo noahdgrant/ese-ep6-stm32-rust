@@ -1,4 +1,4 @@
-//! Floor and car controller code for Engineering Project 6
+//! Floor and car controller test code for Engineering Project 6
 
 #![no_main]
 #![no_std]
@@ -21,20 +21,19 @@ use stm32f3xx_hal::{
     pac::Interrupt,
     prelude::*,
 };
-use systick_monotonic::{Systick, *};
+use systick_monotonic::Systick;
 
-const ID_ELEVATOR_CONTROLLER: u16 = 0x101;
 const ID_CAR_CONTROLLER: u16 = 0x200;
 const ID_FLOOR_1: u16 = 0x201;
 const ID_FLOOR_2: u16 = 0x202;
 const ID_FLOOR_3: u16 = 0x203;
 
 // Change this to one of the above ID's to change the ID that is put on the CAN bus
-const ID: u16 = ID_CAR_CONTROLLER;
+const ID: u16 = ID_FLOOR_1;
 
-const GO_TO_FLOOR_1: u8 = 0x05;
-const GO_TO_FLOOR_2: u8 = 0x06;
-const GO_TO_FLOOR_3: u8 = 0x07;
+const TEST_FLOOR_1: u8 = 0x85;
+const TEST_FLOOR_2: u8 = 0x86;
+const TEST_FLOOR_3: u8 = 0x87;
 
 #[app(device = stm32f3xx_hal::pac, peripherals = true, dispatchers = [SPI1])]
 mod app {
@@ -49,10 +48,12 @@ mod app {
                 Pin<Gpioa, U<11>, Alternate<PushPull, 9>>,
             >,
         >,
-        led_onboard: PA5<Output<PushPull>>,
         led_floor_1: PA4<Output<PushPull>>,
         led_floor_2: PA6<Output<PushPull>>,
         led_floor_3: PA7<Output<PushPull>>,
+        led_current_floor_1: PC5<Output<PushPull>>,
+        led_current_floor_2: PB0<Output<PushPull>>,
+        led_current_floor_3: PB1<Output<PushPull>>,
     }
 
     // Local resources go here
@@ -62,9 +63,7 @@ mod app {
         btn_floor_1: PB12<Input>,
         btn_floor_2: PB15<Input>,
         btn_floor_3: PB14<Input>,
-        led_current_floor_1: PC5<Output<PushPull>>,
-        led_current_floor_2: PB0<Output<PushPull>>,
-        led_current_floor_3: PB1<Output<PushPull>>,
+        led_onboard: PA5<Output<PushPull>>,
     }
 
     #[monotonic(binds = SysTick, default = true)]
@@ -115,8 +114,8 @@ mod app {
             .leave_disabled();
         can.enable_interrupt(bxcan::Interrupt::Fifo0MessagePending);
 
-        let filter_id = StandardId::new(ID_ELEVATOR_CONTROLLER).unwrap();
-        let filter_mask = StandardId::new(0x7FF).unwrap(); // Accept only the specified ID
+        let filter_id = StandardId::new(ID_FLOOR_1).unwrap();
+        let filter_mask = StandardId::new(0xC03).unwrap(); // Accept only 0x201, 0x202, 0x203
 
         let mut filters = can.modify_filters();
         filters.enable_bank(
@@ -211,23 +210,27 @@ mod app {
 
         defmt::debug!("Hardware configuration complete");
 
+        // Turn on floor 1 LEDs at the begining of the test
+        led_floor_1.set_high().unwrap();
+        led_current_floor_1.set_high().unwrap();
+
         // Setup resources
         (
             Shared {
                 can,
-                led_onboard,
                 led_floor_1,
                 led_floor_2,
                 led_floor_3,
+                led_current_floor_1,
+                led_current_floor_2,
+                led_current_floor_3,
             },
             Local {
                 btn_onboard,
                 btn_floor_1,
                 btn_floor_2,
                 btn_floor_3,
-                led_current_floor_1,
-                led_current_floor_2,
-                led_current_floor_3,
+                led_onboard,
             },
             init::Monotonics(mono),
         )
@@ -241,8 +244,8 @@ mod app {
     }
 
     #[task(binds = EXTI15_10,
-        local = [btn_onboard, btn_floor_1, btn_floor_2, btn_floor_3],
-        shared = [can, led_onboard, led_floor_1, led_floor_2, led_floor_3])]
+        local = [btn_onboard, btn_floor_1, btn_floor_2, btn_floor_3, led_onboard],
+        shared = [can])]
     fn exti15_10(mut cx: exti15_10::Context) {
         defmt::debug!("EXTI15_10 interrupt");
 
@@ -252,68 +255,28 @@ mod app {
             cx.local.btn_onboard.clear_interrupt();
             defmt::debug!("Onboard button pressed");
 
-            match ID {
-                ID_CAR_CONTROLLER => {
-                    data = Some([0]);
-                }
-                ID_FLOOR_1 => {
-                    data = Some([GO_TO_FLOOR_1]);
-                }
-                ID_FLOOR_2 => {
-                    data = Some([GO_TO_FLOOR_2]);
-                }
-                ID_FLOOR_3 => {
-                    data = Some([GO_TO_FLOOR_3]);
-                }
-                _ => {
-                    data = Some([0]);
-                }
-            }
+            cx.local.led_onboard.toggle().unwrap();
+            data = Some([0x80]);
         } else if cx.local.btn_floor_1.is_interrupt_pending() {
             defmt::debug!("Floor 1 button pressed");
             cx.local.btn_floor_1.clear_interrupt();
 
-            defmt::debug!("Floor 1 LED on");
-            cx.shared.led_floor_1.lock(|led| {
-                led.set_high().unwrap();
-            });
-
-            data = Some([GO_TO_FLOOR_1]);
+            test_floor_1::spawn().unwrap();
+            data = Some([TEST_FLOOR_1]);
         } else if cx.local.btn_floor_2.is_interrupt_pending() {
             defmt::debug!("Floor 2 button pressed");
             cx.local.btn_floor_2.clear_interrupt();
 
-            defmt::debug!("Floor 2 LED on");
-            cx.shared.led_floor_2.lock(|led| {
-                led.set_high().unwrap();
-            });
-
-            data = Some([GO_TO_FLOOR_2]);
+            test_floor_2::spawn().unwrap();
+            data = Some([TEST_FLOOR_2]);
         } else if cx.local.btn_floor_3.is_interrupt_pending() {
             defmt::debug!("Floor 3 button pressed");
             cx.local.btn_floor_3.clear_interrupt();
 
-            defmt::debug!("Floor 3 LED on");
-            cx.shared.led_floor_3.lock(|led| {
-                led.set_high().unwrap();
-            });
-
-            data = Some([GO_TO_FLOOR_3]);
+            test_floor_3::spawn().unwrap();
+            data = Some([TEST_FLOOR_3]);
         } else {
             defmt::panic!("Unhandeled exti15_10 interrupt");
-        }
-
-        // Turn onboared LED on to indicate that a CAN message is being sent
-        defmt::debug!("Onboard LED on");
-        cx.shared.led_onboard.lock(|led| {
-            led.set_high().unwrap();
-        });
-
-        // Schedule the task to turn the onboard LED off
-        if let Err(_e) = led_onboard_off::spawn_after(2.secs()) {
-            // TODO: Reschedule the task if the button is pressed again
-            // before the 2 seconds have passed.
-            defmt::warn!("Task already started");
         }
 
         // Send CAN message
@@ -332,8 +295,7 @@ mod app {
     }
 
     #[task(binds = USB_LP_CAN_RX0,
-        local = [led_current_floor_1, led_current_floor_2, led_current_floor_3],
-        shared = [can, led_onboard, led_floor_1, led_floor_2, led_floor_3])]
+        shared = [can])]
     fn can_rx0(mut cx: can_rx0::Context) {
         defmt::debug!("CAN rx interrupt");
 
@@ -351,32 +313,14 @@ mod app {
                 );
 
                 match data[0] {
-                    GO_TO_FLOOR_1 => {
-                        cx.shared.led_floor_1.lock(|led| {
-                            defmt::debug!("Floor 1 LED off");
-                            led.set_low().unwrap();
-                        });
-                        cx.local.led_current_floor_1.set_high().unwrap();
-                        cx.local.led_current_floor_2.set_low().unwrap();
-                        cx.local.led_current_floor_3.set_low().unwrap();
+                    TEST_FLOOR_1 => {
+                        test_floor_1::spawn().unwrap();
                     }
-                    GO_TO_FLOOR_2 => {
-                        cx.shared.led_floor_2.lock(|led| {
-                            defmt::debug!("Floor 2 LED off");
-                            led.set_low().unwrap();
-                        });
-                        cx.local.led_current_floor_1.set_low().unwrap();
-                        cx.local.led_current_floor_2.set_high().unwrap();
-                        cx.local.led_current_floor_3.set_low().unwrap();
+                    TEST_FLOOR_2 => {
+                        test_floor_2::spawn().unwrap();
                     }
-                    GO_TO_FLOOR_3 => {
-                        cx.shared.led_floor_3.lock(|led| {
-                            defmt::debug!("Floor 3 LED off");
-                            led.set_low().unwrap();
-                        });
-                        cx.local.led_current_floor_1.set_low().unwrap();
-                        cx.local.led_current_floor_2.set_low().unwrap();
-                        cx.local.led_current_floor_3.set_high().unwrap();
+                    TEST_FLOOR_3 => {
+                        test_floor_3::spawn().unwrap();
                     }
                     _ => (),
                 }
@@ -384,10 +328,77 @@ mod app {
         }
     }
 
-    #[task(shared = [led_onboard])]
-    fn led_onboard_off(mut cx: led_onboard_off::Context) {
-        defmt::debug!("Onboard LED off");
-        cx.shared.led_onboard.lock(|led| {
+    #[task(shared = [led_floor_1, led_floor_2, led_floor_3, led_current_floor_1,
+    led_current_floor_2, led_current_floor_3])]
+    fn test_floor_1(mut cx: test_floor_1::Context) {
+        cx.shared.led_floor_1.lock(|led| {
+            led.set_low().unwrap();
+        });
+        cx.shared.led_current_floor_1.lock(|led| {
+            led.set_low().unwrap();
+        });
+
+        cx.shared.led_floor_2.lock(|led| {
+            led.set_high().unwrap();
+        });
+        cx.shared.led_current_floor_2.lock(|led| {
+            led.set_high().unwrap();
+        });
+
+        cx.shared.led_floor_3.lock(|led| {
+            led.set_low().unwrap();
+        });
+        cx.shared.led_current_floor_3.lock(|led| {
+            led.set_low().unwrap();
+        });
+    }
+
+    #[task(shared = [led_floor_1, led_floor_2, led_floor_3, led_current_floor_1,
+    led_current_floor_2, led_current_floor_3])]
+    fn test_floor_2(mut cx: test_floor_2::Context) {
+        cx.shared.led_floor_1.lock(|led| {
+            led.set_low().unwrap();
+        });
+        cx.shared.led_current_floor_1.lock(|led| {
+            led.set_low().unwrap();
+        });
+
+        cx.shared.led_floor_2.lock(|led| {
+            led.set_low().unwrap();
+        });
+        cx.shared.led_current_floor_2.lock(|led| {
+            led.set_low().unwrap();
+        });
+
+        cx.shared.led_floor_3.lock(|led| {
+            led.set_high().unwrap();
+        });
+        cx.shared.led_current_floor_3.lock(|led| {
+            led.set_high().unwrap();
+        });
+    }
+
+    #[task(shared = [led_floor_1, led_floor_2, led_floor_3, led_current_floor_1,
+    led_current_floor_2, led_current_floor_3])]
+    fn test_floor_3(mut cx: test_floor_3::Context) {
+        cx.shared.led_floor_1.lock(|led| {
+            led.set_high().unwrap();
+        });
+        cx.shared.led_current_floor_1.lock(|led| {
+            led.set_high().unwrap();
+        });
+
+        cx.shared.led_floor_2.lock(|led| {
+            led.set_low().unwrap();
+        });
+        cx.shared.led_current_floor_2.lock(|led| {
+            led.set_low().unwrap();
+        });
+
+        cx.shared.led_floor_3.lock(|led| {
+            led.set_low().unwrap();
+        });
+        cx.shared.led_current_floor_3.lock(|led| {
             led.set_low().unwrap();
         });
     }
