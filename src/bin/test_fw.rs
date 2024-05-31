@@ -115,7 +115,7 @@ mod app {
         can.enable_interrupt(bxcan::Interrupt::Fifo0MessagePending);
 
         let filter_id = StandardId::new(ID_FLOOR_1).unwrap();
-        let filter_mask = StandardId::new(0xC03).unwrap(); // Accept only 0x201, 0x202, 0x203
+        let filter_mask = StandardId::new(0x7FC).unwrap(); // Accept only 0x201, 0x202, 0x203
 
         let mut filters = can.modify_filters();
         filters.enable_bank(
